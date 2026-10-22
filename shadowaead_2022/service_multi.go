@@ -157,9 +157,6 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return shadowaead.ErrBadHeader
 	}
 	requestSalt := requestHeader[:s.keySaltLength]
-	if !s.replayFilter.Check(requestSalt) {
-		return ErrSaltNotUnique
-	}
 
 	var _eiHeader [aes.BlockSize]byte
 	eiHeader := _eiHeader[:]
@@ -259,6 +256,14 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return ErrNoPadding
 	}
 
+	// The salt is recorded only now that the whole request header has been
+	// authenticated, so a forged request cannot burn a salt a real client may
+	// still send. Check inserts atomically: of two concurrent requests with the
+	// same salt only one gets past this point.
+	if !s.replayFilter.Check(requestSalt) {
+		return ErrSaltNotUnique
+	}
+
 	protocolConn := &serverConn{
 		Service:     s.Service,
 		Conn:        conn,
@@ -340,7 +345,7 @@ returnErr:
 	return err
 
 process:
-	if !session.window.Check(packetId) {
+	if !session.checkPacketID(packetId) {
 		err = ErrPacketIdNotUnique
 		goto returnErr
 	}
@@ -353,8 +358,6 @@ process:
 		}
 		buffer.Truncate(buffer.Len() - shadowaead.Overhead)
 	}
-
-	session.window.Add(packetId)
 
 	var headerType byte
 	headerType, err = buffer.ReadByte()
@@ -390,6 +393,14 @@ process:
 	if err != nil {
 		goto returnErr
 	}
+
+	// Only a fully validated packet consumes its packet ID and keeps the
+	// session alive; a packet rejected above leaves both untouched.
+	if !session.acceptPacketID(packetId) {
+		err = ErrPacketIdNotUnique
+		goto returnErr
+	}
+	s.touchUDPSession(sessionId, session)
 
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination

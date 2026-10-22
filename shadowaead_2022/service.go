@@ -52,7 +52,15 @@ type Service struct {
 
 	replayFilter replay.Filter
 	udpNat       *udpnat.Service[uint64]
+	udpTimeout   int64
 	udpSessions  *cache.LruCache[uint64, *serverUDPSession]
+}
+
+// touchUDPSession extends a session after one of its packets was accepted.
+func (s *Service) touchUDPSession(sessionId uint64, session *serverUDPSession) {
+	if s.udpTimeout > 0 {
+		s.udpSessions.StoreWithExpire(sessionId, session, time.Now().Add(time.Duration(s.udpTimeout)*time.Second))
+	}
 }
 
 func NewServiceWithPassword(method string, password string, udpTimeout int64, handler shadowsocks.Handler, timeFunc func() time.Time) (shadowsocks.Service, error) {
@@ -74,9 +82,12 @@ func NewService(method string, psk []byte, udpTimeout int64, handler shadowsocks
 
 		replayFilter: replay.NewSimple(60 * time.Second),
 		udpNat:       udpnat.New[uint64](udpTimeout, handler),
+		udpTimeout:   udpTimeout,
+		// Looking a session up does not extend it: only a packet that passes
+		// every check does, through touchUDPSession, so forged or stale
+		// packets cannot keep a session (and its NAT mapping) alive.
 		udpSessions: cache.New[uint64, *serverUDPSession](
 			cache.WithAge[uint64, *serverUDPSession](udpTimeout),
-			cache.WithUpdateAgeOnGet[uint64, *serverUDPSession](),
 		),
 	}
 
@@ -157,10 +168,6 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.M
 
 	requestSalt := header[:s.keySaltLength]
 
-	if !s.replayFilter.Check(requestSalt) {
-		return ErrSaltNotUnique
-	}
-
 	requestKey := SessionKey(s.psk, requestSalt, s.keySaltLength)
 	readCipher, err := s.constructor(requestKey)
 	if err != nil {
@@ -230,6 +237,12 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.M
 		}
 	} else if reader.Cached() == 0 {
 		return ErrNoPadding
+	}
+
+	// Record the salt only after the request header is authenticated; see
+	// MultiService.NewConnection0.
+	if !s.replayFilter.Check(requestSalt) {
+		return ErrSaltNotUnique
 	}
 
 	protocolConn := &serverConn{
@@ -431,7 +444,7 @@ returnErr:
 	return err
 
 process:
-	if !session.window.Check(packetId) {
+	if !session.checkPacketID(packetId) {
 		err = ErrPacketIdNotUnique
 		goto returnErr
 	}
@@ -444,8 +457,6 @@ process:
 		}
 		buffer.Truncate(buffer.Len() - shadowaead.Overhead)
 	}
-
-	session.window.Add(packetId)
 
 	var headerType byte
 	headerType, err = buffer.ReadByte()
@@ -481,6 +492,13 @@ process:
 	if err != nil {
 		goto returnErr
 	}
+	// Only a fully validated packet consumes its packet ID and keeps the
+	// session alive.
+	if !session.acceptPacketID(packetId) {
+		err = ErrPacketIdNotUnique
+		goto returnErr
+	}
+	s.touchUDPSession(sessionId, session)
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	s.udpNat.NewPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) N.PacketWriter {
@@ -589,8 +607,30 @@ type serverUDPSession struct {
 	packetId        uint64
 	cipher          cipher.AEAD
 	remoteCipher    cipher.AEAD
+	windowAccess    sync.Mutex
 	window          SlidingWindow
 	rng             io.Reader
+}
+
+// checkPacketID reports whether packetId may still be accepted. It is a cheap
+// filter before decryption and does not record anything.
+func (s *serverUDPSession) checkPacketID(packetId uint64) bool {
+	s.windowAccess.Lock()
+	defer s.windowAccess.Unlock()
+	return s.window.Check(packetId)
+}
+
+// acceptPacketID records packetId once its packet has passed every check. It
+// checks again under the same lock, so of two packets with the same ID only
+// one is accepted.
+func (s *serverUDPSession) acceptPacketID(packetId uint64) bool {
+	s.windowAccess.Lock()
+	defer s.windowAccess.Unlock()
+	if !s.window.Check(packetId) {
+		return false
+	}
+	s.window.Add(packetId)
+	return true
 }
 
 func (s *serverUDPSession) nextPacketId() uint64 {
