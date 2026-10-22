@@ -95,4 +95,3 @@ func (h *epochHandler) NewConnection(ctx context.Context, conn net.Conn, metadat
 	h.epoch, h.labelled = shadowsocks.UserEpochFromContext(ctx)
 	return nil
 }
-

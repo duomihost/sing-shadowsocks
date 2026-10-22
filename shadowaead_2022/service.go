@@ -368,12 +368,12 @@ func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) error {
 	return c.writer.WriteVectorised(buffers[1:])
 }
 
+// Close closes the underlying connection. The reader and writer hold nothing
+// to release, and Close may run while the first Write is still installing the
+// writer (for example when a server revokes a user's connections), so it must
+// not read c.writer.
 func (c *serverConn) Close() error {
-	return common.Close(
-		c.Conn,
-		common.PtrOrNil(c.reader),
-		common.PtrOrNil(c.writer),
-	)
+	return c.Conn.Close()
 }
 
 func (c *serverConn) NeedAdditionalReadDeadline() bool {
