@@ -138,6 +138,8 @@ func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, meta
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 
+	// The first chunk decrypted and carried a valid address.
+	shadowsocks.NotifyAuthenticated(ctx)
 	return s.handler.NewConnection(auth.ContextWithUser(ctx, user), &serverConn{
 		Method: method,
 		Conn:   conn,

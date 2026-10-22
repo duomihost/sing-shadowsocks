@@ -244,6 +244,7 @@ func (s *Service) newConnection(ctx context.Context, conn net.Conn, metadata M.M
 	if !s.replayFilter.Check(requestSalt) {
 		return ErrSaltNotUnique
 	}
+	shadowsocks.NotifyAuthenticated(ctx)
 
 	protocolConn := &serverConn{
 		Service:     s,

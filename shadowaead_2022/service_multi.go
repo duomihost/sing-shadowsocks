@@ -185,10 +185,9 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return ErrInvalidRequest
 	}
 
-	if handshakeSuccess != nil {
-		handshakeSuccess()
-	}
-
+	// Finding the user by the identity header does not authenticate the
+	// request: the header AEAD below can still fail. handshakeSuccess and the
+	// authenticated signal are only raised once everything has been checked.
 	requestKey := SessionKey(uPSK, requestSalt, s.keySaltLength)
 	readCipher, err := s.constructor(requestKey)
 	if err != nil {
@@ -262,6 +261,10 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	// same salt only one gets past this point.
 	if !s.replayFilter.Check(requestSalt) {
 		return ErrSaltNotUnique
+	}
+	shadowsocks.NotifyAuthenticated(ctx)
+	if handshakeSuccess != nil {
+		handshakeSuccess()
 	}
 
 	protocolConn := &serverConn{
