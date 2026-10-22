@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-shadowsocks"
 	"github.com/sagernet/sing/common/auth"
@@ -20,10 +21,14 @@ import (
 var _ shadowsocks.MultiService[int] = (*MultiService[int])(nil)
 
 type MultiService[U comparable] struct {
-	name      string
-	methodMap map[U]*Method
-	handler   shadowsocks.Handler
-	udpNat    *udpnat.Service[netip.AddrPort]
+	name string
+	// methods holds a map[U]*Method that is never modified after it is
+	// published. UpdateUsers builds a complete new map and swaps it in, and each
+	// connection or packet reads a single snapshot, so lookups never race with
+	// an update.
+	methods atomic.Value
+	handler shadowsocks.Handler
+	udpNat  *udpnat.Service[netip.AddrPort]
 }
 
 func NewMultiService[U comparable](method string, udpTimeout int64, handler shadowsocks.Handler) (*MultiService[U], error) {
@@ -32,6 +37,7 @@ func NewMultiService[U comparable](method string, udpTimeout int64, handler shad
 		handler: handler,
 		udpNat:  udpnat.New[netip.AddrPort](udpTimeout, handler),
 	}
+	s.methods.Store(map[U]*Method{})
 	return s, nil
 }
 
@@ -39,29 +45,35 @@ func (s *MultiService[U]) Name() string {
 	return s.name
 }
 
+func (s *MultiService[U]) loadMethods() map[U]*Method {
+	return s.methods.Load().(map[U]*Method)
+}
+
 func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
-	s.methodMap = make(map[U]*Method)
+	methodMap := make(map[U]*Method, len(userList))
 	for i, user := range userList {
 		key := keyList[i]
 		method, err := New(s.name, key, "")
 		if err != nil {
 			return err
 		}
-		s.methodMap[user] = method
+		methodMap[user] = method
 	}
+	s.methods.Store(methodMap)
 	return nil
 }
 
 func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
-	s.methodMap = make(map[U]*Method)
+	methodMap := make(map[U]*Method, len(userList))
 	for i, user := range userList {
 		password := passwordList[i]
 		method, err := New(s.name, nil, password)
 		if err != nil {
 			return err
 		}
-		s.methodMap[user] = method
+		methodMap[user] = method
 	}
+	s.methods.Store(methodMap)
 	return nil
 }
 
@@ -74,9 +86,10 @@ func (s *MultiService[U]) NewConnection(ctx context.Context, conn net.Conn, meta
 }
 
 func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+	methodMap := s.loadMethods()
 	var user U
 	var method *Method
-	for u, m := range s.methodMap {
+	for u, m := range methodMap {
 		user, method = u, m
 		break
 	}
@@ -95,7 +108,7 @@ func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, meta
 
 	var reader *Reader
 	var readCipher cipher.AEAD
-	for u, m := range s.methodMap {
+	for u, m := range methodMap {
 		key := buf.NewSize(method.keySaltLength)
 		Kdf(m.key, header.To(m.keySaltLength), key)
 		readCipher, err = m.constructor(key.Bytes())
@@ -144,9 +157,10 @@ func (s *MultiService[U]) NewPacket(ctx context.Context, conn N.PacketConn, buff
 }
 
 func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buffer *buf.Buffer, metadata M.Metadata) error {
+	methodMap := s.loadMethods()
 	var user U
 	var method *Method
-	for u, m := range s.methodMap {
+	for u, m := range methodMap {
 		user, method = u, m
 		break
 	}
@@ -159,7 +173,7 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 	var readCipher cipher.AEAD
 	var err error
 	decrypted := make([]byte, 0, buffer.Len())
-	for u, m := range s.methodMap {
+	for u, m := range methodMap {
 		key := buf.NewSize(m.keySaltLength)
 		Kdf(m.key, buffer.To(m.keySaltLength), key)
 		readCipher, err = m.constructor(key.Bytes())

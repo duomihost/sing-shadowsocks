@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-shadowsocks"
@@ -31,9 +32,21 @@ var _ shadowsocks.MultiService[int] = (*MultiService[int])(nil)
 type MultiService[U comparable] struct {
 	*Service
 
+	// users holds a *multiUserTable[U]. UpdateUsers publishes a complete new
+	// table at once, and every connection or packet reads a single snapshot, so
+	// a concurrent update can never pair a user from one table with a key from
+	// another.
+	users atomic.Value
+}
+
+type multiUserTable[U comparable] struct {
 	uPSK     map[U][]byte
 	uPSKHash map[[aes.BlockSize]byte]U
 	uCipher  map[U]cipher.Block
+}
+
+func (s *MultiService[U]) loadUsers() *multiUserTable[U] {
+	return s.users.Load().(*multiUserTable[U])
 }
 
 func NewMultiServiceWithPassword[U comparable](method string, password string, udpTimeout int64, handler shadowsocks.Handler, timeFunc func() time.Time) (*MultiService[U], error) {
@@ -62,10 +75,12 @@ func NewMultiService[U comparable](method string, iPSK []byte, udpTimeout int64,
 
 	s := &MultiService[U]{
 		Service: ss.(*Service),
-
+	}
+	s.users.Store(&multiUserTable[U]{
 		uPSK:     make(map[U][]byte),
 		uPSKHash: make(map[[aes.BlockSize]byte]U),
-	}
+		uCipher:  make(map[U]cipher.Block),
+	})
 	return s, nil
 }
 
@@ -94,9 +109,11 @@ func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
 		}
 	}
 
-	s.uPSK = uPSK
-	s.uPSKHash = uPSKHash
-	s.uCipher = uCipher
+	s.users.Store(&multiUserTable[U]{
+		uPSK:     uPSK,
+		uPSKHash: uPSKHash,
+		uCipher:  uCipher,
+	})
 	return nil
 }
 
@@ -161,11 +178,12 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	}
 	b.Decrypt(eiHeader, eiHeader)
 
+	users := s.loadUsers()
 	var user U
 	var uPSK []byte
-	if u, loaded := s.uPSKHash[_eiHeader]; loaded {
+	if u, loaded := users.uPSKHash[_eiHeader]; loaded {
 		user = u
-		uPSK = s.uPSK[u]
+		uPSK = users.uPSK[u]
 	} else {
 		return ErrInvalidRequest
 	}
@@ -279,11 +297,12 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 	s.udpBlockCipher.Decrypt(eiHeader, buffer.Range(aes.BlockSize, 2*aes.BlockSize))
 	xorWords(eiHeader, eiHeader, packetHeader)
 
+	users := s.loadUsers()
 	var user U
 	var uPSK []byte
-	if u, loaded := s.uPSKHash[_eiHeader]; loaded {
+	if u, loaded := users.uPSKHash[_eiHeader]; loaded {
 		user = u
-		uPSK = s.uPSK[u]
+		uPSK = users.uPSK[u]
 	} else {
 		return E.New("invalid request")
 	}
@@ -375,7 +394,7 @@ process:
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
-		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, s.uCipher[user]}
+		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, users.uCipher[user]}
 	})
 	return nil
 }
