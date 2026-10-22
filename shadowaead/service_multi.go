@@ -37,7 +37,7 @@ func NewMultiService[U comparable](method string, udpTimeout int64, handler shad
 		handler: handler,
 		udpNat:  udpnat.New[netip.AddrPort](udpTimeout, handler),
 	}
-	s.methods.Store(map[U]*Method{})
+	s.methods.Store(userTable[U]{methods: map[U]*Method{}})
 	return s, nil
 }
 
@@ -46,7 +46,7 @@ func (s *MultiService[U]) Name() string {
 }
 
 func (s *MultiService[U]) loadMethods() map[U]*Method {
-	return s.methods.Load().(map[U]*Method)
+	return s.methods.Load().(userTable[U]).methods
 }
 
 func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
@@ -59,21 +59,43 @@ func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
 		}
 		methodMap[user] = method
 	}
-	s.methods.Store(methodMap)
+	s.methods.Store(userTable[U]{methods: methodMap})
 	return nil
 }
 
-func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
-	methodMap := make(map[U]*Method, len(userList))
-	for i, user := range userList {
-		password := passwordList[i]
-		method, err := New(s.name, nil, password)
-		if err != nil {
-			return err
-		}
-		methodMap[user] = method
+type userTable[U comparable] struct {
+	methods map[U]*Method
+	epoch   uint64
+}
+type preparedUsers[U comparable] struct {
+	service *MultiService[U]
+	table   userTable[U]
+}
+
+func (p preparedUsers[U]) Publish() { p.service.methods.Store(p.table) }
+func (s *MultiService[U]) PrepareUsersWithPasswords(users []U, passwords []string, epoch uint64) (shadowsocks.UserCommit, error) {
+	if len(users) != len(passwords) {
+		return nil, E.New("user/password length mismatch")
 	}
-	s.methods.Store(methodMap)
+	methods := make(map[U]*Method, len(users))
+	for i, user := range users {
+		if _, exists := methods[user]; exists {
+			return nil, E.New("duplicate user")
+		}
+		method, err := New(s.name, nil, passwords[i])
+		if err != nil {
+			return nil, err
+		}
+		methods[user] = method
+	}
+	return preparedUsers[U]{s, userTable[U]{methods, epoch}}, nil
+}
+func (s *MultiService[U]) UpdateUsersWithPasswords(users []U, passwords []string) error {
+	p, err := s.PrepareUsersWithPasswords(users, passwords, 0)
+	if err != nil {
+		return err
+	}
+	p.Publish()
 	return nil
 }
 
@@ -86,7 +108,9 @@ func (s *MultiService[U]) NewConnection(ctx context.Context, conn net.Conn, meta
 }
 
 func (s *MultiService[U]) newConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
-	methodMap := s.loadMethods()
+	table := s.methods.Load().(userTable[U])
+	methodMap := table.methods
+	ctx = shadowsocks.ContextWithUserEpoch(ctx, table.epoch)
 	var user U
 	var method *Method
 	for u, m := range methodMap {
@@ -159,7 +183,9 @@ func (s *MultiService[U]) NewPacket(ctx context.Context, conn N.PacketConn, buff
 }
 
 func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buffer *buf.Buffer, metadata M.Metadata) error {
-	methodMap := s.loadMethods()
+	table := s.methods.Load().(userTable[U])
+	methodMap := table.methods
+	ctx = shadowsocks.ContextWithUserEpoch(ctx, table.epoch)
 	var user U
 	var method *Method
 	for u, m := range methodMap {

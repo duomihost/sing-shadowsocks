@@ -2,6 +2,7 @@ package shadowaead_2022
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"testing"
 
@@ -67,21 +68,58 @@ func TestAuthenticatedRequestCarriesUserEpoch(t *testing.T) {
 	}
 }
 
+// Equal client session IDs from different keys must use independent replay
+// windows and NAT owners. Reassigning the same credential cannot resurrect
+// its old session across a revocation generation.
 func TestUDPSessionRejectsPacketsOfAnotherUser(t *testing.T) {
 	f := newReplayFixture(t)
-	packets := f.udpPackets(2)
-	if err := f.serveUDP(packets[0]); err != nil {
+	defer f.service.Close()
+	firstKey := f.client.pskList[len(f.client.pskList)-1]
+	secondKey := testKey(16)
+	if err := f.service.UpdateUsers([]string{"user", "other"}, [][]byte{firstKey, secondKey}); err != nil {
 		t.Fatal(err)
 	}
-	var session *serverUDPSession
-	f.service.udpSessions.Range(func(_ uint64, s *serverUDPSession) { session = s })
-	session.owner = "someone else"
-	if err := f.serveUDP(packets[1]); err == nil {
-		t.Fatal("packet of a different user was queued on the session")
+	secondMethod, err := New(replayTestMethod, [][]byte{f.client.pskList[0], secondKey}, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	session.owner = "user"
-	if err := f.serveUDP(packets[1]); err != nil {
-		t.Fatalf("rejected packet consumed its packet ID: %v", err)
+	a, b := &captureConn{}, &captureConn{}
+	first := f.client.DialPacketConn(a).(*clientPacketConn)
+	second := secondMethod.DialPacketConn(b).(*clientPacketConn)
+	second.session.sessionId = first.session.sessionId
+	sessionID := make([]byte, 8)
+	binary.BigEndian.PutUint64(sessionID, second.session.sessionId)
+	second.session.cipher, err = second.Method.constructor(SessionKey(secondKey, sessionID, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
+	if _, err = first.WriteTo([]byte("one"), target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = second.WriteTo([]byte("two"), target); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.serveUDP(a.writes[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.serveUDP(b.writes[0]); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.service.sessions) != 2 {
+		t.Fatal("different users shared a session")
+	}
+	if f.handler.waitPackets(2) != 2 {
+		t.Fatal("two owners were not delivered independently")
+	}
+	if err = f.service.UpdateUsers(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.service.UpdateUsers([]string{"user"}, [][]byte{firstKey}); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.serveUDP(a.writes[0]); err == nil {
+		t.Fatal("old credential generation resurrected its UDP session")
 	}
 }
 

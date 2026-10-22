@@ -1,6 +1,7 @@
 package shadowaead_2022
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,17 +38,25 @@ type MultiService[U comparable] struct {
 	// table at once, and every connection or packet reads a single snapshot, so
 	// a concurrent update can never pair a user from one table with a key from
 	// another.
-	users atomic.Value
+	users          atomic.Value
+	udpMu          sync.Mutex
+	sessions       map[multiSessionKey[U]]*multiSession
+	policy         UDPPolicy
+	nextGeneration atomic.Uint64
+	drops          atomic.Uint64
+	lastSweep      time.Time
+	queueBudget    *queueBudget
 }
 
 type multiUserTable[U comparable] struct {
 	// epoch labels the table for callers that track which table
 	// authenticated a request (see shadowsocks.UserEpochFromContext); zero
 	// means unlabelled.
-	epoch    uint64
-	uPSK     map[U][]byte
-	uPSKHash map[[aes.BlockSize]byte]U
-	uCipher  map[U]cipher.Block
+	credentials map[U]*multiCredential
+	epoch       uint64
+	uPSK        map[U][]byte
+	uPSKHash    map[[aes.BlockSize]byte]U
+	uCipher     map[U]cipher.Block
 }
 
 func (s *MultiService[U]) loadUsers() *multiUserTable[U] {
@@ -78,12 +88,14 @@ func NewMultiService[U comparable](method string, iPSK []byte, udpTimeout int64,
 	}
 
 	s := &MultiService[U]{
-		Service: ss.(*Service),
+		Service:  ss.(*Service),
+		sessions: make(map[multiSessionKey[U]]*multiSession),
 	}
 	s.users.Store(&multiUserTable[U]{
-		uPSK:     make(map[U][]byte),
-		uPSKHash: make(map[[aes.BlockSize]byte]U),
-		uCipher:  make(map[U]cipher.Block),
+		uPSK:        make(map[U][]byte),
+		uPSKHash:    make(map[[aes.BlockSize]byte]U),
+		uCipher:     make(map[U]cipher.Block),
+		credentials: make(map[U]*multiCredential),
 	})
 	return s, nil
 }
@@ -98,7 +110,13 @@ type preparedUsers[U comparable] struct {
 
 // Publish makes the table the one every later request authenticates against.
 func (p *preparedUsers[U]) Publish() {
+	old := p.service.loadUsers()
 	p.service.users.Store(p.table)
+	for user, credential := range old.credentials {
+		if p.table.credentials[user] != credential {
+			credential.cancel()
+		}
+	}
 }
 
 // PrepareUsers validates userList and keyList and builds the complete user
@@ -111,17 +129,17 @@ func (s *MultiService[U]) PrepareUsers(userList []U, keyList [][]byte, epoch uin
 		return nil, E.New("users and keys length mismatch")
 	}
 	table := &multiUserTable[U]{
-		epoch:    epoch,
-		uPSK:     make(map[U][]byte, len(userList)),
-		uPSKHash: make(map[[aes.BlockSize]byte]U, len(userList)),
-		uCipher:  make(map[U]cipher.Block, len(userList)),
+		epoch:       epoch,
+		uPSK:        make(map[U][]byte, len(userList)),
+		uPSKHash:    make(map[[aes.BlockSize]byte]U, len(userList)),
+		uCipher:     make(map[U]cipher.Block, len(userList)),
+		credentials: make(map[U]*multiCredential, len(userList)),
 	}
+	old := s.loadUsers()
 	for i, user := range userList {
-		key := keyList[i]
-		if len(key) < s.keySaltLength {
+		key := append([]byte(nil), keyList[i]...)
+		if len(key) != s.keySaltLength {
 			return nil, shadowsocks.ErrBadKey
-		} else if len(key) > s.keySaltLength {
-			key = Key(key, s.keySaltLength)
 		}
 		if _, loaded := table.uPSK[user]; loaded {
 			return nil, E.New("duplicate user at index ", i)
@@ -141,6 +159,12 @@ func (s *MultiService[U]) PrepareUsers(userList []U, keyList [][]byte, epoch uin
 		table.uPSKHash[hash] = user
 		table.uPSK[user] = key
 		table.uCipher[user] = block
+		if credential := old.credentials[user]; credential != nil && bytes.Equal(old.uPSK[user], key) {
+			table.credentials[user] = credential
+		} else {
+			ctx, cancel := context.WithCancel(context.Background())
+			table.credentials[user] = &multiCredential{ctx: ctx, cancel: cancel, generation: s.nextGeneration.Add(1)}
+		}
 	}
 	return &preparedUsers[U]{service: s, table: table}, nil
 }
@@ -193,11 +217,7 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		n   int
 		err error
 	)
-	if handshakeSuccess != nil {
-		n, err = io.ReadFull(handshakeReader, requestHeader)
-	} else {
-		n, err = handshakeReader.Read(requestHeader)
-	}
+	n, err = handshakeReader.Read(requestHeader)
 	if err != nil {
 		return err
 	} else if n < len(requestHeader) {
@@ -309,6 +329,11 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	if !s.replayFilter.Check(requestSalt) {
 		return ErrSaltNotUnique
 	}
+	credential := users.credentials[user]
+	if credential.ctx.Err() != nil {
+		return os.ErrPermission
+	}
+	ctx = shadowsocks.ContextWithCredential(ctx, shadowsocks.Credential{Context: credential.ctx, Generation: credential.generation})
 	shadowsocks.NotifyAuthenticated(ctx)
 	if handshakeSuccess != nil {
 		handshakeSuccess()
@@ -341,132 +366,145 @@ func (s *MultiService[U]) NewPacket(ctx context.Context, conn N.PacketConn, buff
 }
 
 func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buffer *buf.Buffer, metadata M.Metadata) error {
-	if buffer.Len() < PacketMinimalHeaderSize {
+	// Every path owns and releases the input buffer, or transfers it to the queue.
+	owned := true
+	defer func() {
+		if owned {
+			buffer.Release()
+		}
+	}()
+	if buffer.Len() < 2*aes.BlockSize+shadowaead.Overhead+11 {
 		return ErrPacketTooShort
 	}
-
 	packetHeader := buffer.To(aes.BlockSize)
 	s.udpBlockCipher.Decrypt(packetHeader, packetHeader)
-
-	var _eiHeader [aes.BlockSize]byte
-	eiHeader := _eiHeader[:]
-	s.udpBlockCipher.Decrypt(eiHeader, buffer.Range(aes.BlockSize, 2*aes.BlockSize))
-	xorWords(eiHeader, eiHeader, packetHeader)
-
+	var ei [aes.BlockSize]byte
+	s.udpBlockCipher.Decrypt(ei[:], buffer.Range(aes.BlockSize, 2*aes.BlockSize))
+	xorWords(ei[:], ei[:], packetHeader)
 	users := s.loadUsers()
-	var user U
-	var uPSK []byte
-	if u, loaded := users.uPSKHash[_eiHeader]; loaded {
-		user = u
-		uPSK = users.uPSK[u]
-	} else {
-		return E.New("invalid request")
+	user, ok := users.uPSKHash[ei]
+	if !ok {
+		return ErrInvalidRequest
 	}
-
-	var sessionId, packetId uint64
-	err := binary.Read(buffer, binary.BigEndian, &sessionId)
-	if err != nil {
-		return err
+	credential := users.credentials[user]
+	if credential.ctx.Err() != nil {
+		return os.ErrPermission
 	}
-	err = binary.Read(buffer, binary.BigEndian, &packetId)
-	if err != nil {
-		return err
+	sessionID := binary.BigEndian.Uint64(packetHeader[:8])
+	packetID := binary.BigEndian.Uint64(packetHeader[8:])
+	key := multiSessionKey[U]{ei, sessionID}
+	budgetUser := shadowsocks.PacketBudgetUser(ctx, user)
+	// This lock protects the replay check-and-insert and the NAT/session budget.
+	// No I/O or token waiting is performed under it.
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	now := s.time()
+	session := s.sessions[key]
+	if session != nil && now.Sub(session.lastValid) >= s.retention() {
+		if session.nat != nil {
+			session.nat.Close()
+		}
+		delete(s.sessions, key)
+		session = nil
 	}
-
-	buffer.Advance(aes.BlockSize)
-
-	session, loaded := s.udpSessions.LoadOrStore(sessionId, func() *serverUDPSession {
-		session := s.newUDPSession(uPSK)
-		session.owner = user
-		return session
-	})
-	if !loaded {
-		session.remoteSessionId = sessionId
-		key := SessionKey(uPSK, packetHeader[:8], s.keySaltLength)
-		session.remoteCipher, err = s.constructor(key)
+	if session != nil && (session.generation != credential.generation || session.user != any(user)) {
+		return ErrInvalidRequest
+	}
+	if session == nil {
+		session = &multiSession{protocol: s.newUDPSession(users.uPSK[user]), generation: credential.generation, user: user, budgetUser: budgetUser}
+		session.protocol.remoteSessionId = sessionID
+		remoteKey := SessionKey(users.uPSK[user], packetHeader[:8], s.keySaltLength)
+		var err error
+		session.protocol.remoteCipher, err = s.constructor(remoteKey)
 		if err != nil {
 			return err
 		}
-	} else if session.owner != any(user) {
-		// Every packet is checked against the user that opened its session
-		// before it can reach that session's queue, so a session never
-		// carries another identity's packets.
-		return ErrInvalidRequest
 	}
-
-	goto process
-
-returnErr:
-	if !loaded {
-		s.udpSessions.Delete(sessionId)
+	if !session.protocol.window.Check(packetID) {
+		return ErrPacketIdNotUnique
 	}
-	return err
-
-process:
-	if !session.checkPacketID(packetId) {
-		err = ErrPacketIdNotUnique
-		goto returnErr
+	buffer.Advance(2 * aes.BlockSize)
+	if _, err := session.protocol.remoteCipher.Open(buffer.Index(0), packetHeader[4:16], buffer.Bytes(), nil); err != nil {
+		return E.Cause(err, "decrypt packet")
 	}
-
-	if packetHeader != nil {
-		_, err = session.remoteCipher.Open(buffer.Index(0), packetHeader[4:16], buffer.Bytes(), nil)
-		if err != nil {
-			err = E.Cause(err, "decrypt packet")
-			goto returnErr
-		}
-		buffer.Truncate(buffer.Len() - shadowaead.Overhead)
-	}
-
-	var headerType byte
-	headerType, err = buffer.ReadByte()
+	buffer.Truncate(buffer.Len() - shadowaead.Overhead)
+	headerType, err := buffer.ReadByte()
 	if err != nil {
-		err = E.Cause(err, "decrypt packet")
-		goto returnErr
+		return err
 	}
 	if headerType != HeaderTypeClient {
-		err = E.Extend(ErrBadHeaderType, "expected ", HeaderTypeClient, ", got ", headerType)
-		goto returnErr
+		return ErrBadHeaderType
 	}
-
 	var epoch uint64
-	err = binary.Read(buffer, binary.BigEndian, &epoch)
-	if err != nil {
-		goto returnErr
+	if err = binary.Read(buffer, binary.BigEndian, &epoch); err != nil {
+		return err
 	}
-	diff := int(math.Abs(float64(s.time().Unix() - int64(epoch))))
-	if diff > 30 {
-		err = E.Extend(ErrBadTimestamp, "received ", epoch, ", diff ", diff, "s")
-		goto returnErr
+	if math.Abs(float64(now.Unix()-int64(epoch))) > 30 {
+		return ErrBadTimestamp
 	}
-
-	var paddingLen uint16
-	err = binary.Read(buffer, binary.BigEndian, &paddingLen)
-	if err != nil {
-		err = E.Cause(err, "read padding length")
-		goto returnErr
+	var padding uint16
+	if err = binary.Read(buffer, binary.BigEndian, &padding); err != nil {
+		return err
 	}
-	buffer.Advance(int(paddingLen))
-
+	if int(padding) > buffer.Len() {
+		return ErrBadPadding
+	}
+	buffer.Advance(int(padding))
 	destination, err := M.SocksaddrSerializer.ReadAddrPort(buffer)
 	if err != nil {
-		goto returnErr
+		return err
 	}
-
-	// Only a fully validated packet consumes its packet ID and keeps the
-	// session alive; a packet rejected above leaves both untouched.
-	if !session.acceptPacketID(packetId) {
-		err = ErrPacketIdNotUnique
-		goto returnErr
+	if !destination.IsValid() {
+		return ErrInvalidRequest
 	}
-	s.touchUDPSession(sessionId, session)
-
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
-	s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
-		ctx := shadowsocks.ContextWithUserEpoch(ctx, users.epoch)
-		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, users.uCipher[user]}
+	ctx = auth.ContextWithUser(ctx, user)
+	ctx = shadowsocks.ContextWithUserEpoch(ctx, users.epoch)
+	ctx = shadowsocks.ContextWithCredential(ctx, shadowsocks.Credential{Context: credential.ctx, Generation: credential.generation})
+	s.sweep(now)
+	if s.sessions[key] == nil && !s.canCreate(budgetUser) {
+		shadowsocks.NotifyPacketDrop(ctx, user, buffer.Len(), true)
+		s.drops.Add(1)
+		return nil
+	}
+	return shadowsocks.AdmitPacket(ctx, user, buffer.Len(), func(allow bool) error {
+		if credential.ctx.Err() != nil {
+			return os.ErrPermission
+		}
+		session.protocol.window.Add(packetID)
+		session.lastValid = now
+		s.sessions[key] = session
+		if !allow {
+			s.drops.Add(1)
+			return nil
+		}
+		if session.nat == nil || session.nat.isClosed() {
+			nat := newBoundedPacketConn(ctx, metadata.Source, s.policy.QueuePackets, s.policy.QueueBytes)
+			nat.budget = s.queueBudget
+			nat.owner = budgetUser
+			session.nat = nat
+			writer := &serverPacketWriter{s.Service, conn, nat, session.protocol, users.uCipher[user]}
+			nat.writer = writer
+			stop := context.AfterFunc(credential.ctx, func() { _ = nat.Close() })
+			go func() {
+				defer stop()
+				defer nat.Close()
+				err := s.handler.NewPacketConnection(shadowsocks.ContextWithPacketMetered(nat.ctx), nat, metadata)
+				if err != nil {
+					s.handler.NewError(ctx, err)
+				}
+			}()
+		}
+		session.nat.setPeer(metadata.Source)
+		if !session.nat.enqueue(buffer, destination) {
+			shadowsocks.NotifyPacketDrop(ctx, user, buffer.Len(), false)
+			s.drops.Add(1)
+			return nil
+		}
+		owned = false
+		return nil
 	})
-	return nil
 }
 
 func (s *MultiService[U]) newUDPSession(uPSK []byte) *serverUDPSession {

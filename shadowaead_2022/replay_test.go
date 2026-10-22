@@ -172,31 +172,34 @@ func TestRejectedPacketDoesNotExtendUDPSession(t *testing.T) {
 	if err := f.serveUDP(packets[0]); err != nil {
 		t.Fatal(err)
 	}
-	var sessionID uint64
-	f.service.udpSessions.Range(func(id uint64, _ *serverUDPSession) { sessionID = id })
-	session, ok := f.service.udpSessions.Load(sessionID)
-	if !ok {
-		t.Fatal("session not created")
+	f.service.udpMu.Lock()
+	var record *multiSession
+	for _, session := range f.service.sessions {
+		record = session
 	}
-	// Pretend the session is about to expire.
-	soon := time.Now().Add(2 * time.Second)
-	f.service.udpSessions.StoreWithExpire(sessionID, session, soon)
-
+	before := record.lastValid
+	f.service.udpMu.Unlock()
 	f.skew.Store(120)
 	if err := f.serveUDP(packets[1]); err == nil {
 		t.Fatal("stale packet accepted")
 	}
-	if _, expires, _ := f.service.udpSessions.LoadWithExpire(sessionID); expires.Unix() != soon.Unix() {
-		t.Fatalf("rejected packet moved the session expiry from %v to %v", soon, expires)
+	f.service.udpMu.Lock()
+	after := record.lastValid
+	f.service.udpMu.Unlock()
+	if after != before {
+		t.Fatalf("rejected packet moved expiry: %v -> %v", before, after)
 	}
-
 	f.skew.Store(0)
 	if err := f.serveUDP(packets[2]); err != nil {
 		t.Fatal(err)
 	}
-	if _, expires, _ := f.service.udpSessions.LoadWithExpire(sessionID); !expires.After(soon) {
-		t.Fatalf("accepted packet did not extend the session (expires %v)", expires)
+	f.service.udpMu.Lock()
+	after = record.lastValid
+	f.service.udpMu.Unlock()
+	if !after.After(before) {
+		t.Fatal("valid packet did not extend lifetime")
 	}
+
 }
 
 // countingHandler counts connections and UDP packets handed to it.
