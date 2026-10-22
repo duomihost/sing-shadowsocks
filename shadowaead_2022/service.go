@@ -611,6 +611,8 @@ type serverUDPSession struct {
 	windowAccess    sync.Mutex
 	window          SlidingWindow
 	rng             io.Reader
+	// owner is the user that opened the session on a multi-user service.
+	owner any
 }
 
 // checkPacketID reports whether packetId may still be accepted. It is a cheap

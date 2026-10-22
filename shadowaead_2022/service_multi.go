@@ -40,6 +40,10 @@ type MultiService[U comparable] struct {
 }
 
 type multiUserTable[U comparable] struct {
+	// epoch labels the table for callers that track which table
+	// authenticated a request (see shadowsocks.UserEpochFromContext); zero
+	// means unlabelled.
+	epoch    uint64
 	uPSK     map[U][]byte
 	uPSKHash map[[aes.BlockSize]byte]U
 	uCipher  map[U]cipher.Block
@@ -84,52 +88,95 @@ func NewMultiService[U comparable](method string, iPSK []byte, udpTimeout int64,
 	return s, nil
 }
 
-func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
-	uPSK := make(map[U][]byte)
-	uPSKHash := make(map[[aes.BlockSize]byte]U)
-	uCipher := make(map[U]cipher.Block)
+var _ shadowsocks.UserPreparer[int] = (*MultiService[int])(nil)
+
+// preparedUsers is a complete, validated user table waiting to be published.
+type preparedUsers[U comparable] struct {
+	service *MultiService[U]
+	table   *multiUserTable[U]
+}
+
+// Publish makes the table the one every later request authenticates against.
+func (p *preparedUsers[U]) Publish() {
+	p.service.users.Store(p.table)
+}
+
+// PrepareUsers validates userList and keyList and builds the complete user
+// table, including every key schedule, without publishing it. It rejects a
+// list with a duplicate user or a duplicate key: two users with the same key
+// would share an identity hash, and one of them would silently be served as
+// the other. A failed preparation leaves the published table untouched.
+func (s *MultiService[U]) PrepareUsers(userList []U, keyList [][]byte, epoch uint64) (shadowsocks.UserCommit, error) {
+	if len(userList) != len(keyList) {
+		return nil, E.New("users and keys length mismatch")
+	}
+	table := &multiUserTable[U]{
+		epoch:    epoch,
+		uPSK:     make(map[U][]byte, len(userList)),
+		uPSKHash: make(map[[aes.BlockSize]byte]U, len(userList)),
+		uCipher:  make(map[U]cipher.Block, len(userList)),
+	}
 	for i, user := range userList {
 		key := keyList[i]
 		if len(key) < s.keySaltLength {
-			return shadowsocks.ErrBadKey
+			return nil, shadowsocks.ErrBadKey
 		} else if len(key) > s.keySaltLength {
 			key = Key(key, s.keySaltLength)
+		}
+		if _, loaded := table.uPSK[user]; loaded {
+			return nil, E.New("duplicate user at index ", i)
 		}
 
 		var hash [aes.BlockSize]byte
 		hash512 := blake3.Sum512(key)
 		copy(hash[:], hash512[:])
-
-		uPSKHash[hash] = user
-		uPSK[user] = key
-		var err error
-		uCipher[user], err = s.blockConstructor(key)
-		if err != nil {
-			return err
+		if _, loaded := table.uPSKHash[hash]; loaded {
+			return nil, E.New("duplicate user key at index ", i)
 		}
-	}
 
-	s.users.Store(&multiUserTable[U]{
-		uPSK:     uPSK,
-		uPSKHash: uPSKHash,
-		uCipher:  uCipher,
-	})
+		block, err := s.blockConstructor(key)
+		if err != nil {
+			return nil, err
+		}
+		table.uPSKHash[hash] = user
+		table.uPSK[user] = key
+		table.uCipher[user] = block
+	}
+	return &preparedUsers[U]{service: s, table: table}, nil
+}
+
+// PrepareUsersWithPasswords is PrepareUsers with Base64 keys.
+func (s *MultiService[U]) PrepareUsersWithPasswords(userList []U, passwordList []string, epoch uint64) (shadowsocks.UserCommit, error) {
+	keyList := make([][]byte, 0, len(passwordList))
+	for _, password := range passwordList {
+		if password == "" {
+			return nil, shadowsocks.ErrMissingPassword
+		}
+		uPSK, err := base64.StdEncoding.DecodeString(password)
+		if err != nil {
+			return nil, E.Cause(err, "decode psk")
+		}
+		keyList = append(keyList, uPSK)
+	}
+	return s.PrepareUsers(userList, keyList, epoch)
+}
+
+func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
+	prepared, err := s.PrepareUsers(userList, keyList, 0)
+	if err != nil {
+		return err
+	}
+	prepared.Publish()
 	return nil
 }
 
 func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
-	keyList := make([][]byte, 0, len(passwordList))
-	for _, password := range passwordList {
-		if password == "" {
-			return shadowsocks.ErrMissingPassword
-		}
-		uPSK, err := base64.StdEncoding.DecodeString(password)
-		if err != nil {
-			return E.Cause(err, "decode psk")
-		}
-		keyList = append(keyList, uPSK)
+	prepared, err := s.PrepareUsersWithPasswords(userList, passwordList, 0)
+	if err != nil {
+		return err
 	}
-	return s.UpdateUsers(userList, keyList)
+	prepared.Publish()
+	return nil
 }
 
 func (s *MultiService[U]) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
@@ -278,6 +325,7 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	protocolConn.reader = reader
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
+	ctx = shadowsocks.ContextWithUserEpoch(ctx, users.epoch)
 	return s.handler.NewConnection(auth.ContextWithUser(ctx, user), protocolConn, metadata)
 }
 
@@ -328,7 +376,9 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 	buffer.Advance(aes.BlockSize)
 
 	session, loaded := s.udpSessions.LoadOrStore(sessionId, func() *serverUDPSession {
-		return s.newUDPSession(uPSK)
+		session := s.newUDPSession(uPSK)
+		session.owner = user
+		return session
 	})
 	if !loaded {
 		session.remoteSessionId = sessionId
@@ -337,6 +387,11 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 		if err != nil {
 			return err
 		}
+	} else if session.owner != any(user) {
+		// Every packet is checked against the user that opened its session
+		// before it can reach that session's queue, so a session never
+		// carries another identity's packets.
+		return ErrInvalidRequest
 	}
 
 	goto process
@@ -408,6 +463,7 @@ process:
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
+		ctx := shadowsocks.ContextWithUserEpoch(ctx, users.epoch)
 		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, users.uCipher[user]}
 	})
 	return nil
